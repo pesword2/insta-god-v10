@@ -1,4 +1,4 @@
-import os  
+import os
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -15,25 +15,19 @@ from typing import Optional, List
 GIZLI_API_ANAHTARI = "haci_baba_bunu_begenmedi_12345"
 
 # --- AKILLI VERİTABANI AYARI ---
-# 1. Render'dan gelen adresi al, yoksa yerel dosya (SQLite) kullan
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./insta_god_final.db")
-
-# 2. Render 'postgres://' verir ama SQLAlchemy 'postgresql://' ister. Düzeltiyoruz.
 if SQLALCHEMY_DATABASE_URL.startswith("postgres://"):
     SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# 3. SQLite ve PostgreSQL Ayar Farkı
-# "check_same_thread" sadece SQLite'ta lazımdır, Postgres'te hata verir.
 connect_args = {}
 if "sqlite" in SQLALCHEMY_DATABASE_URL:
     connect_args = {"check_same_thread": False}
 
-# 4. Motoru Ateşle
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- MODELLER (RESİM URL EKLENDİ) ---
+# --- MODELLER ---
 class HedefUser(Base):
     __tablename__ = "hedefler"
     id = Column(Integer, primary_key=True, index=True)
@@ -41,7 +35,7 @@ class HedefUser(Base):
     username = Column(String, index=True)
     full_name = Column(String)
     biography = Column(String)
-    profile_pic_url = Column(String)  # <-- YENİ SÜTUN: Profil Resmi
+    profile_pic_url = Column(String)
     followers = Column(Integer)
     following = Column(Integer)
     is_private = Column(Boolean)
@@ -63,13 +57,24 @@ class Takipci(Base):
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(dependencies=[Depends(lambda x_api_key=Header(None): 
-    HTTPException(403, "Yasak") if x_api_key != GIZLI_API_ANAHTARI else None)],
-    docs_url=None, redoc_url=None, openapi_url=None)
+# --- UYGULAMA & GÜVENLİK ---
+app = FastAPI(
+    dependencies=[Depends(lambda x_api_key=Header(None): 
+        HTTPException(403, "⛔ Yetkisiz Giriş") if x_api_key != GIZLI_API_ANAHTARI else None)],
+    docs_url=None, redoc_url=None, openapi_url=None
+)
 
-origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# CORS: Kapıyı Herkese Aç (Yıldız *)
+origins = ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+# --- VERİ MODELLERİ ---
 class AnalizIstegi(BaseModel):
     username: str
     session_id: Optional[str] = ""
@@ -79,28 +84,48 @@ class TakipciIstegi(BaseModel):
     session_id: str
     limit: int = 100
 
+# --- YARDIMCILAR ---
 def get_headers(session_id=""):
-    h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "X-IG-App-ID": "936619743392459", "X-Requested-With": "XMLHttpRequest"}
-    if session_id: h.update({"Cookie": f"sessionid={session_id}", "User-Agent": "Instagram 219.0.0.12.117 Android"})
+    h = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "X-IG-App-ID": "936619743392459",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept-Language": "tr-TR,tr;q=0.9"
+    }
+    if session_id:
+        h["Cookie"] = f"sessionid={session_id}"
+        h["User-Agent"] = "Instagram 219.0.0.12.117 Android"
     return h
 
 def id_tarih_coz(user_id):
-    try: return datetime.fromtimestamp(((int(user_id) >> 23) + 1314220021721) / 1000.0).strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        binary_time = (int(user_id) >> 23) + 1314220021721
+        return datetime.fromtimestamp(binary_time / 1000.0).strftime('%Y-%m-%d %H:%M:%S')
     except: return "Hesaplanamadi"
+
+# --- ENDPOINTLER ---
+
+@app.get("/")
+def ana_sayfa():
+    return {"mesaj": "🔒 Güvenli Insta-God Sunucusu Aktif (V10)"}
 
 @app.post("/api/analiz")
 def analiz_et(istek: AnalizIstegi):
     db = SessionLocal()
     try:
         url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={istek.username}"
-        headers = get_headers(); headers["Referer"] = f"https://www.instagram.com/{istek.username}/"
-        time.sleep(random.uniform(0.8, 1.5))
+        headers = get_headers()
+        headers["Referer"] = f"https://www.instagram.com/{istek.username}/"
         
+        time.sleep(random.uniform(0.8, 1.5)) # Jitter
         r = requests.get(url, headers=headers)
-        if r.status_code != 200: raise HTTPException(404, detail="Kullanıcı bulunamadı.")
         
+        if r.status_code != 200:
+            raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı.")
+            
         user = r.json()["data"]["user"]
         
+        # DB Kayıt
         db_user = db.query(HedefUser).filter(HedefUser.instagram_id == user["id"]).first()
         if not db_user: db_user = HedefUser()
             
@@ -108,8 +133,7 @@ def analiz_et(istek: AnalizIstegi):
         db_user.username = user["username"]
         db_user.full_name = user["full_name"]
         db_user.biography = user["biography"]
-        # RESİM URL'SİNİ ARTIK KAYDEDİYORUZ:
-        db_user.profile_pic_url = user.get("profile_pic_url_hd") 
+        db_user.profile_pic_url = user.get("profile_pic_url_hd") # Resim URL
         db_user.followers = user["edge_followed_by"]["count"]
         db_user.following = user["edge_follow"]["count"]
         db_user.is_private = user["is_private"]
@@ -119,11 +143,73 @@ def analiz_et(istek: AnalizIstegi):
         db_user.public_phone = user.get("business_phone_number")
         db_user.analiz_tarihi = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
-        db.add(db_user); db.commit(); db.refresh(db_user)
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+        
         return {"status": "success", "data": db_user}
-    except Exception as e: raise HTTPException(500, detail=str(e))
-    finally: db.close()
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
-# ... (Diğer fonksiyonlar: stalker_worker, takipci_getir, rapor_getir aynı kalacak)
-# Not: Kodun çok uzamaması için diğer kısımları öncekiyle aynı varsayıyorum.
-# Eğer stalker kısmını da tekrar istersen söyle, eklerim.
+# --- STALKER (TAKİPÇİ) MODÜLÜ ---
+def stalker_worker(hedef_username: str, session_id: str, limit: int):
+    db = SessionLocal()
+    hedef = db.query(HedefUser).filter(HedefUser.username == hedef_username).first()
+    if not hedef:
+        db.close()
+        return
+
+    headers = get_headers(session_id)
+    next_max_id = ""
+    count = 0
+    
+    # Eski listeyi temizle
+    db.query(Takipci).filter(Takipci.hedef_id == hedef.id).delete()
+    db.commit()
+
+    while count < limit:
+        try:
+            url = f"https://i.instagram.com/api/v1/friendships/{hedef.instagram_id}/followers/?count=100&search_surface=follow_list_page&max_id={next_max_id}"
+            r = requests.get(url, headers=headers)
+            resp = r.json()
+            users = resp.get("users", [])
+            if not users: break
+            
+            for u in users:
+                t = Takipci(
+                    hedef_id=hedef.id,
+                    username=u.get("username"),
+                    full_name=u.get("full_name"),
+                    instagram_pk=str(u.get("pk"))
+                )
+                db.add(t)
+                count += 1
+                if count >= limit: break
+            
+            db.commit()
+            next_max_id = resp.get("next_max_id")
+            if not next_max_id: break
+            time.sleep(random.uniform(2.5, 4.5)) # WAF Koruması
+            
+        except: break
+    db.close()
+
+@app.post("/api/takipci_getir")
+def takipci_baslat(istek: TakipciIstegi, background_tasks: BackgroundTasks):
+    background_tasks.add_task(stalker_worker, istek.hedef_username, istek.session_id, istek.limit)
+    return {"status": "started", "message": "İşlem başlatıldı."}
+
+@app.get("/api/rapor/{username}")
+def rapor_goster(username: str):
+    db = SessionLocal()
+    user = db.query(HedefUser).filter(HedefUser.username == username).first()
+    if not user:
+        db.close()
+        raise HTTPException(status_code=404, detail="Kayıt yok.")
+        
+    takipciler = db.query(Takipci).filter(Takipci.hedef_id == user.id).limit(1000).all()
+    db.close()
+    return {"profil": user, "takipci_listesi": takipciler}
