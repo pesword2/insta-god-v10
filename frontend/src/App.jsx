@@ -4,7 +4,7 @@ import { Search, Download, Shield, Calendar, Mail, Phone } from 'lucide-react'
 import './App.css'
 
 // --- AYARLAR ---
-const API_URL = "http://127.0.0.1:8000"
+const API_URL = "https://insta-god-v10.onrender.com"
 const API_KEY = "haci_baba_bunu_begenmedi_12345" // Backend şifresiyle aynı olmalı
 
 function App() {
