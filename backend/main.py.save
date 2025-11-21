@@ -1,0 +1,219 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+import requests
+import random
+import time
+from datetime import datetime
+from typing import List, Optional
+
+# --- VERİTABANI AYARLARI ---
+SQLALCHEMY_DATABASE_URL = "sqlite:///./insta_god_pro.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# --- GELİŞMİŞ DB MODELLERİ ---
+class HedefUser(Base):
+    __tablename__ = "hedefler"
+    id = Column(Integer, primary_key=True, index=True)
+    instagram_id = Column(String, unique=True) # Instagram'ın kendi ID'si
+    username = Column(String, index=True)
+    full_name = Column(String)
+    biography = Column(String)
+    followers = Column(Integer)
+    following = Column(Integer)
+    is_private = Column(Boolean)
+    is_verified = Column(Boolean)
+    
+    # Forensics Verileri
+    kurulus_tarihi = Column(String) # ID'den hesaplanan
+    public_email = Column(String, nullable=True)
+    public_phone = Column(String, nullable=True)
+    
+    analiz_tarihi = Column(String)
+    
+    # İlişki: Bir hedefin binlerce takipçisi olabilir
+    takipci_listesi = relationship("Takipci", back_populates="hedef", cascade="all, delete-orphan")
+
+class Takipci(Base):
+    __tablename__ = "takipciler"
+    id = Column(Integer, primary_key=True, index=True)
+    hedef_id = Column(Integer, ForeignKey("hedefler.id")) # Kime ait olduğu
+    username = Column(String)
+    full_name = Column(String)
+    instagram_pk = Column(String) # Takipçinin ID'si
+    
+    hedef = relationship("HedefUser", back_populates="takipci_listesi")
+
+Base.metadata.create_all(bind=engine)
+
+# --- FASTAPI KURULUMU ---
+app = FastAPI()
+
+# Pydantic Modelleri (Veri Alışverişi İçin)
+class AnalizIstegi(BaseModel):
+    username: str
+    session_id: Optional[str] = ""
+
+class TakipciIstegi(BaseModel):
+    hedef_username: str
+    session_id: str
+    limit: int = 100
+
+# --- YARDIMCI FONKSİYONLAR ---
+def id_den_tarih_coz(user_id):
+    """Instagram Snowflake ID'den tarih çıkarma formülü"""
+    try:
+        binary_time = (int(user_id) >> 23) + 1314220021721
+        tarih = datetime.fromtimestamp(binary_time / 1000.0)
+        return tarih.strftime('%Y-%m-%d %H:%M:%S')
+    except:
+        return "Hesaplanamadi"
+
+def get_headers(session_id=""):
+    h = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "X-IG-App-ID": "936619743392459",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept-Language": "tr-TR,tr;q=0.9"
+    }
+    if session_id:
+        h["Cookie"] = f"sessionid={session_id}"
+        h["User-Agent"] = "Instagram 219.0.0.12.117 Android"
+    return h
+
+# --- 1. API: GENEL ANALİZ VE FORENSICS ---
+@app.post("/api/analiz")
+def analiz_et(istek: AnalizIstegi):
+    db = SessionLocal()
+    try:
+        url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={istek.username}"
+        # Web tarayıcısı taklidi (Login gerektirmez)
+        headers = get_headers() 
+        headers["Referer"] = f"https://www.instagram.com/{istek.username}/"
+        
+        time.sleep(random.uniform(0.5, 1.5)) # WAF Jitter
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı veya Instagram engelledi.")
+            
+        data = response.json()
+        user = data["data"]["user"]
+        
+        # Adli Bilişim Hesabı
+        kurulus = id_den_tarih_coz(user["id"])
+        
+        # Veritabanına Yaz/Güncelle
+        db_user = db.query(HedefUser).filter(HedefUser.instagram_id == user["id"]).first()
+        if not db_user:
+            db_user = HedefUser()
+            
+        db_user.instagram_id = user["id"]
+        db_user.username = user["username"]
+        db_user.full_name = user["full_name"]
+        db_user.biography = user["biography"]
+        db_user.followers = user["edge_followed_by"]["count"]
+        db_user.following = user["edge_follow"]["count"]
+        db_user.is_private = user["is_private"]
+        db_user.is_verified = user["is_verified"]
+        
+        # Forensics Verileri
+        db_user.kurulus_tarihi = kurulus
+        db_user.public_email = user.get("business_email")
+        db_user.public_phone = user.get("business_phone_number")
+        db_user.analiz_tarihi = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+        
+        return {"status": "success", "data": db_user}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+# --- 2. API: TAKİPÇİ DUMP (STALKER MODU) ---
+# Bu işlem uzun sürdüğü için 'BackgroundTasks' kullanıyoruz
+def arka_planda_takipci_cek(hedef_username: str, session_id: str, limit: int):
+    db = SessionLocal()
+    print(f"🕵️‍♂️ [ARKA PLAN] {hedef_username} için {limit} takipçi çekiliyor...")
+    
+    # Önce hedefi DB'den bul
+    hedef = db.query(HedefUser).filter(HedefUser.username == hedef_username).first()
+    if not hedef: return # Önce analiz yapılmalı
+
+    headers = get_headers(session_id)
+    next_max_id = ""
+    count = 0
+    
+    # Mevcut takipçileri temizle (Yenisini çekiyoruz)
+    # (İstersen silmeyip üstüne ekleme mantığı da yapabilirsin)
+    db.query(Takipci).filter(Takipci.hedef_id == hedef.id).delete()
+    db.commit()
+
+    while count < limit:
+        try:
+            url = f"https://i.instagram.com/api/v1/friendships/{hedef.instagram_id}/followers/?count=100&search_surface=follow_list_page&max_id={next_max_id}"
+            r = requests.get(url, headers=headers)
+            resp = r.json()
+            
+            users = resp.get("users", [])
+            if not users: break
+            
+            for u in users:
+                takipci = Takipci(
+                    hedef_id=hedef.id,
+                    username=u.get("username"),
+                    full_name=u.get("full_name"),
+                    instagram_pk=str(u.get("pk"))
+                )
+                db.add(takipci)
+                count += 1
+                if count >= limit: break
+            
+            db.commit()
+            print(f"   ⬇️  {count}/{limit} indirildi...")
+            
+            next_max_id = resp.get("next_max_id")
+            if not next_max_id: break
+            
+            time.sleep(random.uniform(2, 4)) # Engel yememek için bekleme
+            
+        except Exception as e:
+            print(f"❌ Hata: {e}")
+            break
+            
+    db.close()
+    print("✅ Takipçi çekme işlemi bitti.")
+
+@app.post("/api/takipci_getir")
+def takipci_getir(istek: TakipciIstegi, background_tasks: BackgroundTasks):
+    if not istek.session_id:
+        raise HTTPException(status_code=400, detail="Session ID gerekli!")
+    
+    # Arka planda başlat (Web sitesi donmasın)
+    background_tasks.add_task(arka_planda_takipci_cek, istek.hedef_username, istek.session_id, istek.limit)
+    
+    return {"status": "started", "message": f"{istek.hedef_username} için takipçi çekme işlemi başlatıldı. Veritabanına işleniyor."}
+
+# --- 3. API: RAPORLARI GÖRÜNTÜLE ---
+@app.get("/api/rapor/{username}")
+def rapor_getir(username: str):
+    db = SessionLocal()
+    user = db.query(HedefUser).filter(HedefUser.username == username).first()
+    
+    if not user:
+        db.close()
+        raise HTTPException(status_code=404, detail="Bu kişi henüz analiz edilmemiş.")
+    
+    # Takipçileri de getir
+    takipciler = db.query(Takipci).filter(Takipci.hedef_id == user.id).limit(500).all()
+    
+    db.close()
+    return {"profil": user, "takipci_listesi": takipciler}
